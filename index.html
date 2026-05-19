@@ -122,10 +122,20 @@
     box-shadow: 0 0 0 0 rgba(0, 230, 118, 0.6);
     animation: pulse 1.6s infinite;
   }
+  .status-dot.paused {
+    background: #FF9100;
+    box-shadow: 0 0 0 0 rgba(255, 145, 0, 0.6);
+    animation: pulseAmber 1.6s infinite;
+  }
   @keyframes pulse {
     0%   { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0.6); }
     70%  { box-shadow: 0 0 0 10px rgba(0, 230, 118, 0); }
     100% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0); }
+  }
+  @keyframes pulseAmber {
+    0%   { box-shadow: 0 0 0 0 rgba(255, 145, 0, 0.6); }
+    70%  { box-shadow: 0 0 0 10px rgba(255, 145, 0, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 145, 0, 0); }
   }
 
   .timer {
@@ -182,6 +192,31 @@
   .btn-start.recording:hover { background: #ff6b6b; border-color: #ff6b6b; }
   .btn-export { background: var(--surface-2); }
   .btn-export:hover { border-color: #3a3a3a; background: var(--surface-3); }
+
+  .btn-pause {
+    background: var(--surface-2);
+    color: var(--text);
+    display: none;
+    min-width: 110px;
+    gap: 8px;
+  }
+  .btn-pause.visible { display: inline-flex; }
+  .btn-pause:hover { border-color: #3a3a3a; background: var(--surface-3); }
+  .btn-pause.paused {
+    color: #FF9100;
+    border-color: #FF9100;
+    background: rgba(255, 145, 0, 0.08);
+  }
+  .btn-pause.paused:hover {
+    background: rgba(255, 145, 0, 0.16);
+    border-color: #FFA733;
+  }
+  .btn-pause .icon {
+    font-size: 11px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+  }
 
   /* ===== Main 3-column area ===== */
   .main {
@@ -485,6 +520,10 @@
 
       <div class="top-controls">
         <button class="btn-start" id="btnStart">Start</button>
+        <button class="btn-pause" id="btnPause" aria-label="Pause recording">
+          <span class="icon" id="btnPauseIcon">❚❚</span>
+          <span id="btnPauseLabel">Pause</span>
+        </button>
         <button class="btn-export" id="btnExport">Export CSV</button>
       </div>
 
@@ -606,6 +645,9 @@
   const weeklyAvgEl = $('weeklyAvg');
   const weeklyRangeEl = $('weeklyRange');
   const btnStart = $('btnStart');
+  const btnPause = $('btnPause');
+  const btnPauseIcon = $('btnPauseIcon');
+  const btnPauseLabel = $('btnPauseLabel');
   const btnExport = $('btnExport');
   const waveCanvas = $('waveform');
   const historyCanvas = $('historyChart');
@@ -621,7 +663,10 @@
   let rafId = null;
 
   let isRunning = false;
+  let isPaused = false;
   let sessionStart = 0;
+  let pausedAt = 0;
+  let pausedTotal = 0;
   let sessionSamples = 0;
   let sessionSum = 0;
   let sessionPeak = 0;
@@ -954,7 +999,10 @@
     timeData = new Uint8Array(analyser.fftSize);
 
     isRunning = true;
+    isPaused = false;
     sessionStart = performance.now();
+    pausedAt = 0;
+    pausedTotal = 0;
     sessionSamples = 0;
     sessionSum = 0;
     sessionPeak = 0;
@@ -963,14 +1011,49 @@
     btnStart.textContent = 'Stop';
     btnStart.classList.add('recording');
     statusDotEl.classList.add('active');
+    statusDotEl.classList.remove('paused');
     statusTextEl.textContent = 'Recording';
+    btnPause.classList.add('visible');
+    btnPause.classList.remove('paused');
+    btnPauseLabel.textContent = 'Pause';
+    btnPauseIcon.textContent = '❚❚';
+    btnPause.setAttribute('aria-label', 'Pause recording');
 
     loop();
+  }
+
+  function togglePause() {
+    if (!isRunning) return;
+    if (!isPaused) {
+      isPaused = true;
+      pausedAt = performance.now();
+      btnPause.classList.add('paused');
+      btnPauseLabel.textContent = 'Resume';
+      btnPauseIcon.textContent = '▶';
+      btnPause.setAttribute('aria-label', 'Resume recording');
+      statusDotEl.classList.remove('active');
+      statusDotEl.classList.add('paused');
+      statusTextEl.textContent = 'Paused';
+    } else {
+      isPaused = false;
+      pausedTotal += performance.now() - pausedAt;
+      pausedAt = 0;
+      btnPause.classList.remove('paused');
+      btnPauseLabel.textContent = 'Pause';
+      btnPauseIcon.textContent = '❚❚';
+      btnPause.setAttribute('aria-label', 'Pause recording');
+      statusDotEl.classList.add('active');
+      statusDotEl.classList.remove('paused');
+      statusTextEl.textContent = 'Recording';
+    }
   }
 
   function stop() {
     if (!isRunning) return;
     isRunning = false;
+    isPaused = false;
+    pausedAt = 0;
+    pausedTotal = 0;
 
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
@@ -992,7 +1075,13 @@
     btnStart.textContent = 'Start';
     btnStart.classList.remove('recording');
     statusDotEl.classList.remove('active');
+    statusDotEl.classList.remove('paused');
     statusTextEl.textContent = 'Idle';
+    btnPause.classList.remove('visible');
+    btnPause.classList.remove('paused');
+    btnPauseLabel.textContent = 'Pause';
+    btnPauseIcon.textContent = '❚❚';
+    btnPause.setAttribute('aria-label', 'Pause recording');
 
     drawAll();
   }
@@ -1013,6 +1102,8 @@
   function loop() {
     if (!isRunning) return;
     rafId = requestAnimationFrame(loop);
+
+    if (isPaused) return; // freeze: skip sampling, history, UI updates, and redraws
 
     const db = computeDb();
     currentDb = db;
@@ -1040,7 +1131,7 @@
       statCurrentEl.textContent = Math.round(db);
       statAvgEl.textContent = Math.round(sessionSum / sessionSamples);
       statPeakEl.textContent = Math.round(sessionPeak);
-      sessionTimeEl.textContent = fmtTime(now - sessionStart);
+      sessionTimeEl.textContent = fmtTime(now - sessionStart - pausedTotal);
       historySubEl.textContent = `${history.length} / ${MAX_HISTORY} samples`;
     }
 
@@ -1096,6 +1187,7 @@
     if (isRunning) stop();
     else start();
   });
+  btnPause.addEventListener('click', togglePause);
   btnExport.addEventListener('click', exportCsv);
 
   // ResizeObserver for canvases — redraw immediately when their container resizes
