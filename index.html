@@ -475,6 +475,37 @@
     margin-left: 4px;
   }
 
+  /* ===== Heatmap ===== */
+  .heatmap-wrap {
+    flex: 1;
+    min-height: 140px;
+    position: relative;
+  }
+  .heatmap-wrap canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: crosshair;
+  }
+  .heatmap-tooltip {
+    position: absolute;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--text);
+    pointer-events: none;
+    display: none;
+    white-space: nowrap;
+    z-index: 10;
+    font-variant-numeric: tabular-nums;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+  .heatmap-tooltip.show { display: block; }
+
   /* ===== Error ===== */
   .error-banner {
     position: fixed;
@@ -506,6 +537,7 @@
     .col { min-height: auto; }
     .db-card { padding: 40px 20px; }
     .canvas-wrap { height: 200px; }
+    .heatmap-wrap { height: 180px; }
   }
 </style>
 </head>
@@ -583,7 +615,7 @@
 
       <!-- Right column: weekly -->
       <div class="col">
-        <div class="card" style="flex:1;">
+        <div class="card flex-1">
           <div class="card-title">
             <span>Weekly report</span>
             <span class="sub" id="weeklyRange">—</span>
@@ -593,6 +625,16 @@
             <span class="weekly-avg-value" id="weeklyAvg">—</span>
             <span class="weekly-avg-unit">dB</span>
             <span class="weekly-avg-caption">7-day average</span>
+          </div>
+        </div>
+        <div class="card flex-1">
+          <div class="card-title">
+            <span>Hourly heatmap</span>
+            <span class="sub">7 days × 24 hours</span>
+          </div>
+          <div class="heatmap-wrap">
+            <canvas id="heatmapChart"></canvas>
+            <div class="heatmap-tooltip" id="heatmapTooltip"></div>
           </div>
         </div>
       </div>
@@ -652,6 +694,8 @@
   const waveCanvas = $('waveform');
   const historyCanvas = $('historyChart');
   const weeklyCanvas = $('weeklyChart');
+  const heatmapCanvas = $('heatmapChart');
+  const heatmapTooltipEl = $('heatmapTooltip');
   const refScale = $('refScale');
 
   // ---------- State ----------
@@ -672,6 +716,18 @@
   let sessionPeak = 0;
   let currentDb = 0;
   let history = [];
+
+  // Hourly accumulator since last storage flush, keyed by date then hour.
+  // Buffering reads avoids parsing/serializing localStorage every frame.
+  let hourlyAccum = {}; // { 'YYYY-MM-DD': { 'HH': { sum, count, peak } } }
+  let lastStorageFlush = 0;
+  const STORAGE_FLUSH_INTERVAL = 1000;
+  // Track which dates have already had their session count incremented this run,
+  // so a session crossing midnight counts once per day it touches.
+  let sessionCountedDates = new Set();
+
+  // Cached heatmap cell rects for hit-testing hover/click
+  let heatmapCells = [];
 
   // ---------- Helpers ----------
   function classifyDb(db) {
@@ -719,10 +775,37 @@
   }
 
   // ---------- Weekly storage ----------
+  // Schema (current):
+  //   { 'YYYY-MM-DD': {
+  //       hours: { 'HH': { sum, count, peak } },
+  //       dailyAvg, dailyPeak, sessions
+  //     } }
+  // Old schema had { sum, count, avg, peak } at the day level — migrate on load.
+  function migrateWeekly(obj) {
+    let dirty = false;
+    for (const key of Object.keys(obj)) {
+      const entry = obj[key];
+      if (entry && !entry.hours) {
+        obj[key] = {
+          hours: {},
+          dailyAvg: typeof entry.avg === 'number' ? entry.avg : 0,
+          dailyPeak: typeof entry.peak === 'number' ? entry.peak : 0,
+          sessions: typeof entry.count === 'number' ? entry.count : 0,
+        };
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(obj)); } catch (_e) {}
+    }
+    return obj;
+  }
+
   function loadWeekly() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : {};
+      const obj = raw ? JSON.parse(raw) : {};
+      return migrateWeekly(obj);
     } catch (_e) { return {}; }
   }
 
@@ -742,21 +825,48 @@
     return days;
   }
 
-  function saveSessionToWeekly() {
-    if (sessionSamples === 0) return;
-    const avg = sessionSum / sessionSamples;
+  function ensureDayEntry(data, dateKey) {
+    let entry = data[dateKey];
+    if (!entry || !entry.hours) {
+      entry = data[dateKey] = { hours: {}, dailyAvg: 0, dailyPeak: 0, sessions: 0 };
+    }
+    return entry;
+  }
+
+  function recomputeDailyAggregates(entry) {
+    let totalSum = 0, totalCount = 0, maxPeak = 0;
+    for (const b of Object.values(entry.hours)) {
+      totalSum += b.sum;
+      totalCount += b.count;
+      if (b.peak > maxPeak) maxPeak = b.peak;
+    }
+    entry.dailyAvg = totalCount > 0 ? totalSum / totalCount : 0;
+    entry.dailyPeak = maxPeak;
+  }
+
+  function flushToStorage() {
+    const dateKeys = Object.keys(hourlyAccum);
+    if (dateKeys.length === 0) return false;
     const data = loadWeekly();
-    const todayKey = isoDate(new Date());
-    const existing = data[todayKey];
-    if (existing && typeof existing.sum === 'number' && typeof existing.count === 'number') {
-      existing.sum += avg;
-      existing.count += 1;
-      existing.avg = existing.sum / existing.count;
-      existing.peak = Math.max(existing.peak || 0, sessionPeak);
-    } else {
-      data[todayKey] = { sum: avg, count: 1, avg: avg, peak: sessionPeak };
+    for (const dateKey of dateKeys) {
+      const entry = ensureDayEntry(data, dateKey);
+      if (!sessionCountedDates.has(dateKey)) {
+        entry.sessions = (entry.sessions || 0) + 1;
+        sessionCountedDates.add(dateKey);
+      }
+      const dayBuf = hourlyAccum[dateKey];
+      for (const hourKey of Object.keys(dayBuf)) {
+        const buf = dayBuf[hourKey];
+        const bucket = entry.hours[hourKey] || (entry.hours[hourKey] = { sum: 0, count: 0, peak: 0 });
+        bucket.sum += buf.sum;
+        bucket.count += buf.count;
+        if (buf.peak > bucket.peak) bucket.peak = buf.peak;
+      }
+      recomputeDailyAggregates(entry);
     }
     saveWeekly(data);
+    hourlyAccum = {};
+    return true;
   }
 
   // ---------- Rendering: waveform ----------
@@ -892,7 +1002,7 @@
     const values = days.map((d) => {
       const key = isoDate(d);
       const entry = data[key];
-      return entry && typeof entry.avg === 'number' ? entry.avg : 0;
+      return entry && typeof entry.dailyAvg === 'number' ? entry.dailyAvg : 0;
     });
 
     const padL = 18, padR = 10, padT = 22, padB = 26;
@@ -942,6 +1052,75 @@
     const wAvg = used.length ? used.reduce((a, b) => a + b, 0) / used.length : NaN;
     weeklyAvgEl.textContent = isFinite(wAvg) ? Math.round(wAvg) : '—';
     weeklyRangeEl.textContent = `${isoDate(days[0])} — ${isoDate(days[6])}`;
+  }
+
+  // ---------- Rendering: hourly heatmap ----------
+  function drawHeatmap() {
+    const { ctx, w, h } = setupCanvas(heatmapCanvas);
+    ctx.clearRect(0, 0, w, h);
+
+    const data = loadWeekly();
+    const days = getLast7Days();
+
+    const padL = 34, padR = 8, padT = 8, padB = 20;
+    const innerW = w - padL - padR;
+    const innerH = h - padT - padB;
+    const cellW = innerW / 24;
+    const cellH = innerH / 7;
+
+    heatmapCells = [];
+
+    ctx.font = '10px Pretendard Variable, sans-serif';
+
+    // Y-axis: day labels
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let r = 0; r < 7; r++) {
+      const d = days[r];
+      const isToday = isoDate(d) === isoDate(new Date());
+      ctx.fillStyle = isToday ? '#fff' : '#888';
+      const cy = padT + cellH * (r + 0.5);
+      ctx.fillText(DAY_LABELS[d.getDay()], padL - 6, cy);
+    }
+
+    // Cells
+    const cellPad = 1;
+    for (let r = 0; r < 7; r++) {
+      const d = days[r];
+      const key = isoDate(d);
+      const entry = data[key];
+      const hours = entry && entry.hours ? entry.hours : null;
+      for (let c = 0; c < 24; c++) {
+        const x = padL + cellW * c;
+        const y = padT + cellH * r;
+        const hKey = String(c).padStart(2, '0');
+        const bucket = hours ? hours[hKey] : null;
+        let color = '#1a1a1a';
+        let avg = null, peak = null;
+        if (bucket && bucket.count > 0) {
+          avg = bucket.sum / bucket.count;
+          peak = bucket.peak;
+          color = classifyDb(avg).color;
+        }
+        ctx.fillStyle = color;
+        ctx.fillRect(x + cellPad, y + cellPad, cellW - cellPad * 2, cellH - cellPad * 2);
+        heatmapCells.push({
+          x, y, w: cellW, h: cellH,
+          dayLabel: DAY_LABELS[d.getDay()],
+          hour: c,
+          avg, peak,
+        });
+      }
+    }
+
+    // X-axis: hour labels
+    ctx.fillStyle = '#555';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    [0, 3, 6, 9, 12, 15, 18, 21].forEach((hr) => {
+      const cx = padL + cellW * (hr + 0.5);
+      ctx.fillText(String(hr), cx, padT + innerH + 4);
+    });
   }
 
   function roundRect(ctx, x, y, w, h, r) {
@@ -1007,6 +1186,9 @@
     sessionSum = 0;
     sessionPeak = 0;
     history = [];
+    hourlyAccum = {};
+    lastStorageFlush = performance.now();
+    sessionCountedDates = new Set();
 
     btnStart.textContent = 'Stop';
     btnStart.classList.add('recording');
@@ -1058,7 +1240,7 @@
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
 
-    saveSessionToWeekly();
+    flushToStorage();
 
     if (sourceNode) { try { sourceNode.disconnect(); } catch (_e) {} sourceNode = null; }
     if (analyser) { try { analyser.disconnect(); } catch (_e) {} analyser = null; }
@@ -1115,7 +1297,24 @@
     if (history.length >= MAX_HISTORY) history.shift();
     history.push(db);
 
+    // Accumulate into the current date+hour bucket
+    const nowDate = new Date();
+    const dateKey = isoDate(nowDate);
+    const hourKey = String(nowDate.getHours()).padStart(2, '0');
+    const dayBuf = hourlyAccum[dateKey] || (hourlyAccum[dateKey] = {});
+    const hourBuf = dayBuf[hourKey] || (dayBuf[hourKey] = { sum: 0, count: 0, peak: 0 });
+    hourBuf.sum += db;
+    hourBuf.count += 1;
+    if (db > hourBuf.peak) hourBuf.peak = db;
+
     const now = performance.now();
+    if (now - lastStorageFlush > STORAGE_FLUSH_INTERVAL) {
+      lastStorageFlush = now;
+      if (flushToStorage()) {
+        drawWeekly();
+        drawHeatmap();
+      }
+    }
     if (now - lastUiUpdate > 80) {
       lastUiUpdate = now;
       const cls = classifyDb(db);
@@ -1143,17 +1342,23 @@
   function exportCsv() {
     const data = loadWeekly();
     const days = getLast7Days();
-    const rows = [['date', 'day', 'average_db', 'peak_db', 'sessions']];
+    const rows = [['date', 'hour', 'avg_db', 'peak_db', 'sample_count']];
     days.forEach((d) => {
       const key = isoDate(d);
-      const e = data[key];
-      rows.push([
-        key,
-        DAY_LABELS[d.getDay()],
-        e && isFinite(e.avg) ? e.avg.toFixed(2) : '',
-        e && isFinite(e.peak) ? e.peak.toFixed(2) : '',
-        e && isFinite(e.count) ? e.count : 0,
-      ]);
+      const entry = data[key];
+      if (!entry || !entry.hours) return;
+      const hourKeys = Object.keys(entry.hours).sort();
+      hourKeys.forEach((h) => {
+        const b = entry.hours[h];
+        if (!b || b.count === 0) return;
+        rows.push([
+          key,
+          h,
+          (b.sum / b.count).toFixed(2),
+          b.peak.toFixed(2),
+          b.count,
+        ]);
+      });
     });
     const csv = rows.map((r) => r.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -1180,6 +1385,7 @@
     drawWaveform();
     drawHistory();
     drawWeekly();
+    drawHeatmap();
   }
 
   // ---------- Wiring ----------
@@ -1197,12 +1403,33 @@
   ro.observe(waveCanvas.parentElement);
   ro.observe(historyCanvas.parentElement);
   ro.observe(weeklyCanvas.parentElement);
+  ro.observe(heatmapCanvas.parentElement);
+
+  function showHeatmapTooltipAt(clientX, clientY) {
+    const rect = heatmapCanvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    const cell = heatmapCells.find((c) => x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h);
+    if (cell && cell.avg !== null) {
+      const hh = String(cell.hour).padStart(2, '0');
+      heatmapTooltipEl.textContent = `${cell.dayLabel} ${hh}:00 — ${Math.round(cell.avg)} dB avg, ${Math.round(cell.peak)} dB peak`;
+      heatmapTooltipEl.style.left = (cell.x + cell.w / 2) + 'px';
+      heatmapTooltipEl.style.top = cell.y + 'px';
+      heatmapTooltipEl.style.transform = 'translate(-50%, calc(-100% - 6px))';
+      heatmapTooltipEl.classList.add('show');
+    } else {
+      heatmapTooltipEl.classList.remove('show');
+    }
+  }
+  heatmapCanvas.addEventListener('mousemove', (e) => showHeatmapTooltipAt(e.clientX, e.clientY));
+  heatmapCanvas.addEventListener('mouseleave', () => heatmapTooltipEl.classList.remove('show'));
+  heatmapCanvas.addEventListener('click', (e) => showHeatmapTooltipAt(e.clientX, e.clientY));
 
   window.addEventListener('resize', drawAll);
 
   window.addEventListener('beforeunload', () => {
     if (isRunning) {
-      saveSessionToWeekly();
+      flushToStorage();
       if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
       if (audioCtx) audioCtx.close().catch(() => {});
     }
